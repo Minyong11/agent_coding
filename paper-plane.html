@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Paper Plane — Infinite Sky</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { overflow:hidden; background:#000; font-family:'Helvetica Neue',Arial,sans-serif; }
+  canvas { display:block; }
+
+  #hud {
+    position:fixed; bottom:28px; left:28px;
+    color:rgba(255,255,255,0.85); font-size:14px;
+    line-height:1.8; pointer-events:none;
+    text-shadow:0 1px 4px rgba(0,0,0,0.5);
+  }
+  #hud .val { font-weight:700; color:#fff; min-width:60px; display:inline-block; }
+
+  #hints {
+    position:fixed; bottom:28px; right:28px;
+    color:rgba(255,255,255,0.7); font-size:12px;
+    line-height:1.9; pointer-events:none;
+    text-shadow:0 1px 4px rgba(0,0,0,0.5);
+    transition:opacity 1.5s ease;
+  }
+  #hints.fade { opacity:0; }
+  #hints span { color:rgba(255,255,255,0.4); }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div>SPEED&nbsp;&nbsp;<span class="val" id="spd">0</span> km/h</div>
+  <div>ALT&nbsp;&nbsp;&nbsp;&nbsp;<span class="val" id="alt">0</span> m</div>
+  <div>PITCH&nbsp;&nbsp;<span class="val" id="pch">0°</span></div>
+  <div>DIST&nbsp;&nbsp;&nbsp;<span class="val" id="dist">0</span> km</div>
+</div>
+
+<div id="hints">
+  <span>W/S</span> pitch&nbsp;&nbsp;&nbsp;<span>A/D</span> bank<br>
+  <span>Z</span> slower&nbsp;&nbsp;<span>X</span> faster
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://unpkg.com/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ─── SCENE SETUP ──────────────────────────────────────────
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x5b9bd5); // sky blue base
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
+renderer.setSize(window.innerWidth,window.innerHeight);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const camera = new THREE.PerspectiveCamera(60,window.innerWidth/window.innerHeight,0.5,2000);
+camera.position.set(0,6,-20);
+camera.lookAt(0,0,30);
+
+// ─── LIGHTING ─────────────────────────────────────────────
+const ambient = new THREE.AmbientLight(0x8899bb,1.2);
+scene.add(ambient);
+
+const hemi = new THREE.HemisphereLight(0x99bbff,0x445566,0.8);
+scene.add(hemi);
+
+const sun = new THREE.DirectionalLight(0xfff5e8,2.5);
+sun.position.set(200,300,100);
+sun.castShadow = true;
+sun.shadow.mapSize.set(512,512);
+sun.shadow.camera.near=1; sun.shadow.camera.far=1500;
+sun.shadow.camera.left=-80; sun.shadow.camera.right=80;
+sun.shadow.camera.top=80; sun.shadow.camera.bottom=-80;
+scene.add(sun);
+
+// ─── SKY GRADIENT (vertex-colored sphere) ────────────────
+const skyGeo = new THREE.SphereGeometry(900,64,32);
+// Gradient: white-blue at top, deeper blue at horizon, pale at bottom
+const skyPos = skyGeo.attributes.position;
+const skyColors = [];
+const topColor = new THREE.Color(0x9cc8f0);   // pale blue top
+const midColor = new THREE.Color(0x5b9bd5);   // mid blue
+const lowColor = new THREE.Color(0xc8ddf5);   // hazy horizon
+for (let i=0;i<skyPos.count;i++) {
+  const y = skyPos.getY(i);
+  const t = THREE.MathUtils.smoothstep(y/900, -0.3, 0.6);
+  const c = topColor.clone().lerp(midColor, t).lerp(lowColor, t*t);
+  skyColors.push(c.r,c.g,c.b);
+}
+skyGeo.setAttribute('color',new THREE.BufferAttribute(new Float32Array(skyColors),3));
+const skyMat = new THREE.MeshBasicMaterial({vertexColors:true,side:THREE.BackSide});
+const sky = new THREE.Mesh(skyGeo,skyMat);
+scene.add(sky);
+
+// ─── GROUND PLANE (subtle) ────────────────────────────────
+const groundGeo = new THREE.PlaneGeometry(2000,2000);
+const groundMat = new THREE.MeshPhongMaterial({color:0x8fbc6f,side:THREE.DoubleSide});
+const ground = new THREE.Mesh(groundGeo,groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.position.y = -120;
+ground.receiveShadow = true;
+scene.add(ground);
+
+// ─── PAPER AIRPLANE GEOMETRY ──────────────────────────────
+function createAirplane() {
+  const group = new THREE.Group();
+
+  // materials
+  const bodyMat = new THREE.MeshPhongMaterial({color:0xf0f0f0,flatShading:true,specular:0x222222,shininess:20});
+  const wingMat = new THREE.MeshPhongMaterial({color:0xf5f5f5,flatShading:true,specular:0x111111,shininess:15});
+  const creaseMat = new THREE.LineBasicMaterial({color:0xcccccc,linewidth:1});
+
+  // --- Fuselage: narrow triangular wedge ---
+  // Vertices: nose tip, tail top, tail bottom, body width points
+  const fuselageGeo = new THREE.BufferGeometry();
+  const fv = new Float32Array([
+    // nose (0)
+     0.0, 0.0,  2.5,
+    // top-ridge front (1)
+     0.0, 0.25, 1.0,
+    // bottom-keel front (2)
+     0.0,-0.25, 1.0,
+    // top-ridge mid (3)
+     0.0, 0.30,-0.5,
+    // bottom-keel mid (4)
+     0.0,-0.30,-0.5,
+    // tail top (5)
+     0.0, 0.20,-2.5,
+    // tail bottom (6)
+     0.0,-0.20,-2.5,
+    // left-wing-root front (7)
+    -0.15, 0.0,  1.5,
+    // right-wing-root front (8)
+     0.15, 0.0,  1.5,
+  ]);
+  // Two sides: left half + right half of the diamond cross-section
+  // Left side triangles: nose→top→bottom (top half), nose→bottom→keel (bottom half)
+  const fi = [
+    // left side
+    0,1,2,  0,2,4,  0,4,3,  0,3,1,
+    1,3,5,  2,4,6,  1,5,4,  2,3,4,
+    3,5,4,  4,5,6,
+    // right side (mirrored - flip x sign in shader? No, just duplicate with negated x in verts)
+    // Actually let's just build vertices for both sides...
+  ];
+  // Simpler: build a proper half, mirror
+
+  // Let me redo fuselage more simply with a triangle-wedge shape
+  // We'll build vertices for BOTH sides to avoid mirroring complexity
+  const allVerts = [];
+  const allIdx = [];
+
+  function addV(x,y,z) { allVerts.push(x,y,z); return (allVerts.length/3)-1; }
+
+  // Nose tip
+  const n = addV(0,0,2.5);
+  // Ridge line (top edge)
+  const r0 = addV(0,0.35,1.2);
+  const r1 = addV(0,0.3, -0.3);
+  const r2 = addV(0,0.18,-2.5);
+  // Keel line (bottom edge)
+  const k0 = addV(0,-0.3,1.2);
+  const k1 = addV(0,-0.25,-0.3);
+  const k2 = addV(0,-0.15,-2.5);
+  // Left side points
+  const l0 = addV(-0.12,0.02,1.2);
+  const l1 = addV(-0.12,0.02,-0.3);
+  // Right side points
+  const r0s = addV(0.12,0.02,1.2);
+  const r1s = addV(0.12,0.02,-0.3);
+
+  // Left half triangles
+  function tri(a,b,c) { allIdx.push(a,b,c); }
+  // top-left panel
+  tri(n,l0,r0); tri(l0,l1,r1); tri(l0,r1,r0);
+  // bottom-left panel
+  tri(n,k0,l0); tri(k0,l1,l0); tri(k0,k1,l1);
+  // left tail
+  tri(r1,l1,r2); tri(l1,k1,r2); tri(k1,k2,r2);
+  // right half (mirror)
+  tri(n,r0s,r0); tri(r0s,r1s,r1); tri(r0s,r1,r0);
+  tri(n,r0s,k0); tri(r0s,l0,k0); tri(r0s,k1,k0); // wait, need proper right-side verts
+  // Let me fix: right side needs its own ridge/keel transitions
+
+  // Actually, this is getting complicated. Let me build the fuselage as separate panels.
+  fuselageGeo.setAttribute('position',new THREE.BufferAttribute(new Float32Array(allVerts),3));
+  fuselageGeo.setIndex(allIdx);
+  fuselageGeo.computeVertexNormals();
+
+  // --- Simpler approach: use a few merged BufferGeometry pieces ---
+
+  // Clean start: build each panel as a separate mesh, group them
+  group.clear();
+
+  // FUSELAGE — left panel
+  const lfGeo = new THREE.BufferGeometry();
+  const lfv = new Float32Array([
+    // nose
+     0, 0, 2.5,
+    // top-ridge front
+     0, 0.32, 1.2,
+    // bottom-keel front
+     0,-0.28, 1.2,
+    // top-ridge mid
+     0, 0.28,-0.5,
+    // bottom-keel mid
+     0,-0.24,-0.5,
+    // tail top
+     0, 0.16,-2.5,
+    // tail bottom
+     0,-0.12,-2.5,
+    // left-mid-front
+    -0.1, 0, 1.2,
+    // left-mid-rear
+    -0.1, 0,-0.5,
+  ]);
+  lfGeo.setAttribute('position',new THREE.BufferAttribute(lfv,3));
+  lfGeo.setIndex([
+    0,1,7, 0,7,2,       // nose to mid
+    1,3,8, 1,8,7,       // top ridge
+    2,7,8, 2,8,4,       // bottom keel
+    3,5,8, 4,8,6,       // tail
+    3,8,4, 5,6,8,       // tail cross
+  ]);
+  lfGeo.computeVertexNormals();
+  const leftFuse = new THREE.Mesh(lfGeo,bodyMat);
+  leftFuse.castShadow = true;
+  group.add(leftFuse);
+
+  // FUSELAGE — right panel (mirror)
+  const rfGeo = new THREE.BufferGeometry();
+  const rfv = new Float32Array([
+     0, 0, 2.5,
+     0, 0.32, 1.2,
+     0,-0.28, 1.2,
+     0, 0.28,-0.5,
+     0,-0.24,-0.5,
+     0, 0.16,-2.5,
+     0,-0.12,-2.5,
+     0.1, 0, 1.2,
+     0.1, 0,-0.5,
+  ]);
+  rfGeo.setAttribute('position',new THREE.BufferAttribute(rfv,3));
+  rfGeo.setIndex([
+    0,7,1, 0,2,7,
+    1,8,3, 1,7,8,
+    2,8,7, 2,4,8,
+    3,8,5, 4,6,8,
+    3,4,8, 5,8,6,
+  ]);
+  rfGeo.computeVertexNormals();
+  const rightFuse = new THREE.Mesh(rfGeo,bodyMat);
+  rightFuse.castShadow = true;
+  group.add(rightFuse);
+
+  // LEFT WING — triangular, dihedral angle
+  const lwGeo = new THREE.BufferGeometry();
+  const lwv = new Float32Array([
+    -0.05, 0.02, 0.3,   // root front
+    -0.05, 0.02,-0.5,   // root rear
+    -2.2,  0.55, 0.0,   // tip front (dihedral up)
+    -1.8,  0.50,-0.8,   // tip rear
+  ]);
+  lwGeo.setAttribute('position',new THREE.BufferAttribute(lwv,3));
+  lwGeo.setIndex([0,2,1, 1,2,3, 0,1,3, 0,3,2]);
+  lwGeo.computeVertexNormals();
+  const leftWing = new THREE.Mesh(lwGeo,wingMat);
+  leftWing.castShadow = true;
+  group.add(leftWing);
+
+  // RIGHT WING — triangular, dihedral angle
+  const rwGeo = new THREE.BufferGeometry();
+  const rwv = new Float32Array([
+     0.05, 0.02, 0.3,
+     0.05, 0.02,-0.5,
+     2.2,  0.55, 0.0,
+     1.8,  0.50,-0.8,
+  ]);
+  rwGeo.setAttribute('position',new THREE.BufferAttribute(rwv,3));
+  rwGeo.setIndex([0,1,2, 1,3,2, 0,3,1, 0,2,3]);
+  rwGeo.computeVertexNormals();
+  const rightWing = new THREE.Mesh(rwGeo,wingMat);
+  rightWing.castShadow = true;
+  group.add(rightWing);
+
+  // TAIL FIN (vertical stabilizer)
+  const tfGeo = new THREE.BufferGeometry();
+  const tfv = new Float32Array([
+     0, 0.15,-1.8,   // base front
+     0, 0.12,-2.5,   // base rear
+     0, 0.60,-2.0,   // tip
+  ]);
+  tfGeo.setAttribute('position',new THREE.BufferAttribute(tfv,3));
+  tfGeo.setIndex([0,2,1]);
+  tfGeo.computeVertexNormals();
+  const tailFin = new THREE.Mesh(tfGeo,wingMat);
+  tailFin.castShadow = true;
+  group.add(tailFin);
+
+  // CREASE LINES (edges for folded-paper look)
+  const edgeMat = new THREE.LineBasicMaterial({color:0xcccccc,transparent:true,opacity:0.4});
+  // center crease along fuselage ridge + keel
+  const creasePts = [new THREE.Vector3(0,0,2.5),new THREE.Vector3(0,0.32,1.2),
+    new THREE.Vector3(0,0.28,-0.5),new THREE.Vector3(0,0.16,-2.5)];
+  const creaseGeo = new THREE.BufferGeometry().setFromPoints(creasePts);
+  group.add(new THREE.Line(creaseGeo,edgeMat));
+
+  const keelPts = [new THREE.Vector3(0,0,2.5),new THREE.Vector3(0,-0.28,1.2),
+    new THREE.Vector3(0,-0.24,-0.5),new THREE.Vector3(0,-0.12,-2.5)];
+  const keelLineGeo = new THREE.BufferGeometry().setFromPoints(keelPts);
+  group.add(new THREE.Line(keelLineGeo,edgeMat));
+
+  return group;
+}
+
+const airplane = createAirplane();
+airplane.castShadow = true;
+scene.add(airplane);
+
+// ─── CLOUD SYSTEM ────────────────────────────────────────
+const clouds = [];
+const CLOUD_COUNT = 40;
+const FAR_CLOUDS = 20; // first N are far/parallax layer
+const cloudMatNear = new THREE.MeshPhongMaterial({color:0xffffff,transparent:true,opacity:0.7,flatShading:true});
+const cloudMatFar  = new THREE.MeshPhongMaterial({color:0xffffff,transparent:true,opacity:0.45,flatShading:true});
+
+function randomCloud(mat) {
+  const group = new THREE.Group();
+  const count = 3 + Math.floor(Math.random()*6);
+  for (let i=0;i<count;i++) {
+    const rx = 1+Math.random()*3;
+    const ry = 0.3+Math.random()*1.2;
+    const rz = 0.5+Math.random()*2;
+    const geo = new THREE.SphereGeometry(1,7,5);
+    const mesh = new THREE.Mesh(geo,mat);
+    mesh.scale.set(rx,ry,rz);
+    mesh.position.set((Math.random()-0.5)*5,(Math.random()-0.5)*1.5,(Math.random()-0.5)*4);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    group.add(mesh);
+  }
+  return group;
+}
+
+function repositionCloud(cloud, isFar, aheadZ) {
+  // Place ahead of current position
+  cloud.position.x = (Math.random()-0.5)*200;
+  cloud.position.y = 20 + Math.random()*80;
+  cloud.position.z = aheadZ + Math.random()*300;
+}
+
+// Spawn initial clouds
+for (let i=0;i<CLOUD_COUNT;i++) {
+  const isFar = i<FAR_CLOUDS;
+  const cloud = randomCloud(isFar?cloudMatFar:cloudMatNear);
+  repositionCloud(cloud, isFar, -100 + Math.random()*400);
+  cloud.userData = {isFar,parallax:isFar?0.25:0.6};
+  scene.add(cloud);
+  clouds.push(cloud);
+}
+
+// ─── FLIGHT STATE ────────────────────────────────────────
+const state = {
+  position: new THREE.Vector3(0,30,0),
+  speed: 60,          // current speed (units/s)
+  targetSpeed: 60,
+  pitch: 0,           // radians, positive = nose UP (climb)
+  targetPitch: 0,
+  bank: 0,            // radians, positive = roll right
+  targetBank: 0,
+  heading: 0,         // radians, 0 = +Z
+  distance: 0,
+};
+
+// ─── INPUT ────────────────────────────────────────────────
+const keys = {};
+const GAME_KEYS = new Set(['w','a','s','d','z','x','arrowup','arrowdown','arrowleft','arrowright',' ']);
+window.addEventListener('keydown',e=>{
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+  if (GAME_KEYS.has(k)) e.preventDefault();
+});
+window.addEventListener('keyup',e=>{
+  const k = e.key.toLowerCase();
+  keys[k] = false;
+  if (GAME_KEYS.has(k)) e.preventDefault();
+});
+
+// ─── MIN/MAX CONSTANTS ───────────────────────────────────
+const MIN_SPEED = 30;
+const MAX_SPEED = 140;
+const MAX_BANK = 1.0;    // ~57 degrees
+const MAX_PITCH = 0.8;   // ~46 degrees — aggressive climb/dive
+const GRAVITY = 8.0;     // stronger pull, player must counter with W
+
+// ─── CAMERA TARGET ───────────────────────────────────────
+const camTarget = new THREE.Vector3();
+
+// ─── HUD ELEMENTS ────────────────────────────────────────
+const hudSpd = document.getElementById('spd');
+const hudAlt = document.getElementById('alt');
+const hudPch = document.getElementById('pch');
+const hudDist = document.getElementById('dist');
+const hintsEl = document.getElementById('hints');
+
+// fade hints after 5s
+setTimeout(()=>hintsEl.classList.add('fade'),5000);
+
+// ─── HANDLE RESIZE ───────────────────────────────────────
+window.addEventListener('resize',()=>{
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+});
+
+// ─── GAME LOOP ───────────────────────────────────────────
+let prevTime = performance.now();
+const clock = new THREE.Clock();
+
+function update() {
+  const dt = Math.min(clock.getDelta(),0.1); // cap dt
+
+  // --- INPUT → TARGETS (positive pitch = nose UP / climb) ---
+  if (keys['w']) state.targetPitch = MAX_PITCH;
+  else if (keys['s']) state.targetPitch = -MAX_PITCH;
+  else state.targetPitch = 0;
+
+  if (keys['a']) state.targetBank = MAX_BANK;
+  else if (keys['d']) state.targetBank = -MAX_BANK;
+  else state.targetBank = 0;
+
+  if (keys['z']) state.targetSpeed = MIN_SPEED;
+  else if (keys['x']) state.targetSpeed = MAX_SPEED;
+  else state.targetSpeed = 80; // default cruise
+
+  // --- SMOOTH LERP (exponential decay) ---
+  const lerpK = 5; // responsiveness
+  const f = 1 - Math.exp(-lerpK * dt);
+  state.pitch += (state.targetPitch - state.pitch) * f;
+  state.bank  += (state.targetBank  - state.bank)  * f;
+  state.speed += (state.targetSpeed - state.speed) * f;
+
+  // --- PHYSICS ---
+  const cosH = Math.cos(state.heading);
+  const sinH = Math.sin(state.heading);
+  const cosP = Math.cos(state.pitch);
+  const sinP = Math.sin(state.pitch);
+  // Forward: positive pitch = nose UP → +Y component
+  const forward = new THREE.Vector3(sinH * cosP, sinP, cosH * cosP).normalize();
+
+  // Velocity (units/s)
+  const vel = forward.clone().multiplyScalar(state.speed);
+
+  // Banking gradually changes heading
+  state.heading += state.bank * 1.0 * dt * (state.speed / 60);
+
+  // Gravity: acceleration applied to velocity per-frame (units/s²)
+  vel.y -= GRAVITY * dt;
+
+  // Update position: velocity * dt (units)
+  state.position.add(vel.clone().multiplyScalar(dt));
+
+  // Floor clamp (don't go below ground)
+  if (state.position.y < 5) {
+    state.position.y = 5;
+    if (vel.y<0) vel.y = 0; // soft landing
+  }
+  // Ceiling
+  if (state.position.y > 200) state.position.y = 200;
+
+  // Distance
+  state.distance += state.speed * dt;
+
+  // --- UPDATE AIRPLANE TRANSFORM ---
+  airplane.position.copy(state.position);
+  // Orientation: heading (Y rotation) + pitch (X rotation) + bank (Z rotation)
+  airplane.rotation.set(0,0,0);
+  airplane.rotateY(state.heading);
+  airplane.rotateX(state.pitch);
+  airplane.rotateZ(state.bank);
+
+  // --- CAMERA FOLLOW (behind + above, lerp) ---
+  // Desired camera position: behind and above the plane
+  const behind = new THREE.Vector3(0,-2.5,12);
+  behind.applyQuaternion(airplane.quaternion);
+  camTarget.copy(state.position).add(behind);
+
+  // Look-at point: ahead of the plane
+  const lookAhead = new THREE.Vector3(0,0.2,-8);
+  lookAhead.applyQuaternion(airplane.quaternion);
+  const lookTarget = state.position.clone().add(lookAhead);
+
+  const camLerp = 1-Math.exp(-3*dt);
+  camera.position.lerp(camTarget, camLerp);
+  camera.lookAt(
+    camera.position.clone().lerp(lookTarget,camLerp*0.5)
+  );
+
+  // --- CLOUD RECYCLING ---
+  const aheadZ = state.position.z + 200;
+  const behindZ = state.position.z - 150;
+  for (const cloud of clouds) {
+    // Parallax: far clouds lag behind plane movement
+    const p = cloud.userData.parallax;
+    cloud.position.z -= state.speed * (1-p) * dt;
+    // Keep X relative
+    cloud.position.x -= (state.speed * sinH * (1-p)) * dt * 0.3;
+    // Recycle if behind
+    if (cloud.position.z < behindZ) {
+      repositionCloud(cloud, cloud.userData.isFar, aheadZ);
+      cloud.position.x = state.position.x + (Math.random()-0.5)*200;
+    }
+  }
+
+  // --- SKY FOLLOW ────────────────────────────────────────
+  sky.position.copy(state.position);
+
+  // --- HUD UPDATE ────────────────────────────────────────
+  hudSpd.textContent = Math.round(state.speed*3.6);
+  hudAlt.textContent = Math.round(state.position.y);
+  hudPch.textContent = Math.round(state.pitch * 180 / Math.PI) + '\u00b0';
+  hudDist.textContent = (state.distance/1000).toFixed(1);
+
+  // --- RENDER ────────────────────────────────────────────
+  renderer.render(scene,camera);
+  requestAnimationFrame(update);
+}
+
+// ─── START ───────────────────────────────────────────────
+requestAnimationFrame(update);
+</script>
+</body>
+</html>
